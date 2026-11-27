@@ -71,4 +71,4 @@ Start-Process "$env:SystemRoot\System32\wscript.exe" "`"$InstallDir\ClaudeUsageT
 
 Write-Host ""
 Write-Host "✅ 설치 완료! 작업표시줄 트레이에서 % 아이콘을 확인하세요."
-Write-Host "   (숨김 아이콘 ^ 안에 있을 수 있습니다. 숫자 대신 ! 가 뜨면 'claude auth login' 로그인이 필요합니다)"
+Write-Host "   (숨김 아이콘 ^ 안에 있을 수 있습니다. ! 가 뜨면 아이콘 우클릭 → 'Claude 로그인'으로 브라우저 승인)"

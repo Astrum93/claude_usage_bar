@@ -1,17 +1,18 @@
 ﻿# ClaudeUsageTray — 윈도우 작업표시줄 트레이에 Claude 사용량 표시
-# 필요: Claude Code 로그인 (%USERPROFILE%\.claude\.credentials.json 이 있어야 함)
+# 로그인: 우클릭 메뉴 'Claude 로그인'으로 브라우저 승인 (앱 전용 로그인). Claude Code 로그인 파일은 읽기만 한다.
 # 실행: powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File ClaudeUsageTray.ps1
 # 오류 기록: %LOCALAPPDATA%\ClaudeUsageBar\cubr.log
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Security   # DPAPI (앱 로그인 정보 암호화)
 
 # 구형 윈도우/PowerShell 5.1은 기본이 TLS 1.0이라 api.anthropic.com 접속이 실패할 수 있다
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-$script:CredPath = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+$script:CredPath = Join-Path $env:USERPROFILE ".claude\.credentials.json"   # Claude Code 로그인 (읽기 전용)
 $script:ClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code 공개 OAuth 클라이언트
-$script:TokenUrl = "https://console.anthropic.com/v1/oauth/token"
+$script:TokenUrl = "https://platform.claude.com/v1/oauth/token"
 $script:UsageUrl = "https://api.anthropic.com/api/oauth/usage"
 $script:LogDir   = Join-Path $env:LOCALAPPDATA "ClaudeUsageBar"
 $script:LogPath  = Join-Path $script:LogDir "cubr.log"
@@ -73,59 +74,207 @@ function Set-RefreshSec($s) {
 }
 
 # ---- 자격증명 ----
+#
+# 토큰 출처 우선순위 (맥 버전과 같다):
+#  1) %USERPROFILE%\.claude\cubr-token — 사용자가 직접 넣어둔 장기 토큰(선택). 갱신 없음.
+#  2) 앱 전용 로그인 — 메뉴 'Claude 로그인'으로 브라우저 승인 1회. 앱이 자기 토큰만 갱신한다.
+#  3) Claude Code 로그인 파일(.credentials.json) — 읽기 전용. 절대 갱신하거나 되쓰지 않는다.
+#
+# 왜 앱 전용 로그인인가: Claude Code와 같은 토큰을 같이 갱신하면 갱신 토큰이 회전될 때
+# 한쪽이 든 토큰이 무효가 되어 Claude Code가 로그아웃되고 앱도 멈춘다. 별도 로그인은 서로 건드릴 일이 없다.
+#
+# 앱 전용 로그인 정보는 %LOCALAPPDATA%\ClaudeUsageBar\auth.dat 에 DPAPI(현재 사용자)로 암호화해 저장한다.
 
-function Read-Credentials {
-    if (-not (Test-Path $script:CredPath)) {
-        throw "Claude Code 로그인 정보 없음 — 터미널에서 claude auth login 실행 필요"
+$script:AuthPath     = Join-Path $script:LogDir "auth.dat"
+$script:AuthorizeUrl = "https://claude.com/cai/oauth/authorize"
+$script:Scopes       = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+$script:NeedLogin    = "로그인 필요 — 우클릭 메뉴에서 'Claude 로그인'을 눌러 주세요"
+$script:CachedStore  = $null
+
+function New-Store($access, $refresh, $expiresAt, [string]$source) {
+    [pscustomobject]@{ AccessToken = $access; RefreshToken = $refresh; ExpiresAt = $expiresAt; Source = $source }
+}
+
+function Test-Expired($s) {
+    if (-not $s.ExpiresAt) { return $false }
+    return ([long]$s.ExpiresAt -lt ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000))
+}
+
+# -- 앱 전용 로그인 저장소 --
+
+function Read-OwnAuth {
+    if (-not (Test-Path $script:AuthPath)) { return $null }
+    try {
+        $enc = [System.IO.File]::ReadAllBytes($script:AuthPath)
+        $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($enc, $null,
+                    [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $o = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if (-not $o.accessToken) { return $null }
+        return New-Store $o.accessToken $o.refreshToken $o.expiresAt "own"
+    } catch {
+        Write-Log "앱 로그인 정보 읽기 실패: $($_.Exception.Message)"
+        return $null
     }
+}
+
+function Write-OwnAuth($s) {
+    $json = @{ accessToken = $s.AccessToken; refreshToken = $s.RefreshToken; expiresAt = $s.ExpiresAt } | ConvertTo-Json -Compress
+    $enc = [System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes($json), $null,
+              [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+    [System.IO.File]::WriteAllBytes($script:AuthPath, $enc)
+}
+
+function Remove-OwnAuth {
+    if (Test-Path $script:AuthPath) { Remove-Item $script:AuthPath -Force -ErrorAction SilentlyContinue }
+}
+
+# 토큰 응답 → 저장소 형태
+function Convert-TokenResponse($o, $previousRefresh) {
+    if (-not $o -or -not $o.access_token) { return $null }
+    $exp = $null
+    if ($o.expires_in) { $exp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [long]([double]$o.expires_in * 1000) }
+    $refresh = if ($o.refresh_token) { $o.refresh_token } else { $previousRefresh }
+    return New-Store $o.access_token $refresh $exp "own"
+}
+
+# -- Claude Code 로그인 파일 (읽기 전용) --
+
+function Read-CliStore {
+    if (-not (Test-Path $script:CredPath)) { return $null }
     # Claude Code가 파일을 쓰는 도중일 수 있으니 짧게 재시도
     for ($i = 0; $i -lt 3; $i++) {
         try {
-            $raw = [System.IO.File]::ReadAllText($script:CredPath)
-            $raw = $raw.TrimStart([char]0xFEFF)  # 혹시 남아 있는 BOM 제거
-            return ($raw | ConvertFrom-Json)
+            $raw = [System.IO.File]::ReadAllText($script:CredPath).TrimStart([char]0xFEFF)
+            $oauth = ($raw | ConvertFrom-Json).claudeAiOauth
+            if (-not $oauth -or -not $oauth.accessToken) { return $null }
+            $exp = if ($oauth.expiresAt -and [long]$oauth.expiresAt -gt 0) { [long]$oauth.expiresAt } else { $null }
+            return New-Store $oauth.accessToken $null $exp "cli"
         } catch {
-            if ($i -eq 2) { throw "로그인 정보 파일을 읽을 수 없음: $($_.Exception.Message)" }
+            if ($i -eq 2) { return $null }
             Start-Sleep -Milliseconds 300
         }
     }
 }
 
-function Write-Credentials($cred) {
-    # BOM 없는 UTF-8로 써야 한다. Set-Content -Encoding UTF8 은 BOM을 붙여서
-    # Claude Code(Node.js)가 JSON 파싱에 실패해 로그인이 깨진다.
-    $json = $cred | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($script:CredPath, $json, (New-Object System.Text.UTF8Encoding $false))
+# -- 토큰 선택 --
+
+function Get-Store {
+    $c = $script:CachedStore
+    if ($c -and -not ($c.Source -eq "cli" -and (Test-Expired $c))) { return $c }
+
+    # 1) 수동 등록 토큰 파일
+    $tokenPath = Join-Path $env:USERPROFILE ".claude\cubr-token"
+    if (Test-Path $tokenPath) {
+        $raw = [System.IO.File]::ReadAllText($tokenPath)
+        if ($raw -match 'sk-ant-[A-Za-z0-9_\-]{20,}') {
+            $script:CachedStore = New-Store $Matches[0] $null $null "tokenFile"
+            return $script:CachedStore
+        }
+    }
+    # 2) 앱 전용 로그인
+    $own = Read-OwnAuth
+    if ($own) { $script:CachedStore = $own; return $own }
+    # 3) Claude Code 로그인 파일 (읽기 전용, 유효할 때만)
+    $cli = Read-CliStore
+    if ($cli -and -not (Test-Expired $cli)) { $script:CachedStore = $cli; return $cli }
+    $script:CachedStore = $null
+    return $null
+}
+
+# -- 토큰 갱신 (앱 전용 로그인만) --
+
+function Update-OwnToken($store) {
+    if (-not $store.RefreshToken) { throw $script:NeedLogin }
+    $body = @{
+        grant_type    = "refresh_token"
+        refresh_token = $store.RefreshToken
+        client_id     = $script:ClientId
+        scope         = $script:Scopes
+    } | ConvertTo-Json
+    try {
+        $resp = Invoke-RestMethod -Uri $script:TokenUrl -Method Post -ContentType "application/json" -Body $body -TimeoutSec 30
+    } catch {
+        $script:CachedStore = $null
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        Write-Log "토큰 갱신 실패($code): $($_.Exception.Message)"
+        if ($code -eq 400 -or $code -eq 401) {
+            Remove-OwnAuth   # 갱신 토큰이 무효 — 다시 로그인해야 함
+            throw $script:NeedLogin
+        }
+        throw "토큰 갱신 실패($code) — 다음 갱신 때 다시 시도"
+    }
+    $s = Convert-TokenResponse $resp $store.RefreshToken
+    if (-not $s) { throw "토큰 갱신 응답을 해석할 수 없음" }
+    Write-OwnAuth $s
+    $script:CachedStore = $s
+    Write-Log "앱 전용 토큰 갱신 성공"
+    return $s
 }
 
 function Get-FreshToken {
-    $cred = Read-Credentials
-    $oauth = $cred.claudeAiOauth
-    if (-not $oauth -or -not $oauth.accessToken) {
-        throw "로그인 정보에 토큰 없음 — claude auth login 다시 실행 필요"
+    $store = Get-Store
+    if (-not $store) { throw $script:NeedLogin }
+    if ($store.Source -eq "own" -and (Test-Expired $store)) { $store = Update-OwnToken $store }
+    return $store.AccessToken
+}
+
+# -- 앱 전용 로그인 (브라우저 승인 → localhost 콜백 → 토큰 교환, C# Cubr.OAuthLogin) --
+
+$script:Login = $null
+$script:LoginInProgress = $false
+
+function Get-LoginPage([string]$title, [string]$msg) {
+    "<!doctype html><meta charset=utf-8><title>$title</title>" +
+    "<body style='font-family:Segoe UI,sans-serif;text-align:center;padding-top:15vh'>" +
+    "<h2>&#x2733; $title</h2><p>$msg</p></body>"
+}
+
+function Get-LoginErrorText([string]$code) {
+    if ($code -like "port:*")     { return "로그인 준비 실패 (포트를 열 수 없음)" }
+    if ($code -eq "timeout")      { return "로그인 시간 초과 — 다시 시도해 주세요" }
+    if ($code -eq "state")        { return "로그인 실패 — 승인 정보 불일치" }
+    if ($code -like "exchange:*") { return "토큰 교환 실패($($code.Substring(9))) — 다시 시도해 주세요" }
+    return "로그인 실패 — 다시 시도해 주세요"
+}
+
+function Start-Login {
+    if ($script:Login) { $script:Login.Cancel() }
+    $l = New-Object Cubr.OAuthLogin $script:ClientId, $script:AuthorizeUrl, $script:TokenUrl, $script:Scopes
+    $l.SuccessHtml = Get-LoginPage "로그인 완료" "ClaudeUsageBar 로그인이 끝났습니다. 이 창은 닫아도 됩니다."
+    $l.FailHtml    = Get-LoginPage "로그인 실패" "승인 정보가 올바르지 않습니다. 메뉴에서 다시 시도해 주세요."
+    # Completed는 C# 쪽에서 UI 스레드로 넘겨서 발생시킨다
+    $l.add_Completed({ param($s, $e) Complete-Login $s $e })
+    $script:Login = $l
+    $script:LoginInProgress = $true
+    Write-Log "로그인 시작"
+    $l.Start()
+}
+
+function Complete-Login($sender, $e) {
+    if (-not [object]::ReferenceEquals($sender, $script:Login)) { return }  # 취소된 이전 시도
+    $script:Login = $null
+    $script:LoginInProgress = $false
+    if ($e.Error) {
+        Write-Log "로그인 실패: $($e.Error)"
+        if ($e.Error -ne "cancelled") { $script:LastError = Get-LoginErrorText $e.Error }
+        Render-State
+        return
     }
-    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    if ($oauth.expiresAt -and ([long]$oauth.expiresAt -lt ($nowMs + 60000))) {
-        # 만료 → 갱신. 갱신 토큰이 회전되므로 원본 파일에 되써서 Claude Code와 같은 체인을 유지한다.
-        if (-not $oauth.refreshToken) { throw "토큰 만료 (갱신 토큰 없음) — Claude Code를 한 번 실행하거나 claude auth login" }
-        $body = @{ grant_type = "refresh_token"; refresh_token = $oauth.refreshToken; client_id = $script:ClientId } | ConvertTo-Json
-        try {
-            $resp = Invoke-RestMethod -Uri $script:TokenUrl -Method Post -ContentType "application/json" -Body $body -TimeoutSec 15
-        } catch {
-            Write-Log "토큰 갱신 실패: $($_.Exception.Message)"
-            throw "토큰 갱신 실패 — Claude Code를 한 번 실행해 로그인을 갱신해 주세요"
-        }
-        $oauth.accessToken = $resp.access_token
-        if ($resp.refresh_token) { $oauth.refreshToken = $resp.refresh_token }
-        if ($resp.expires_in) {
-            $newExp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [long]($resp.expires_in * 1000)
-            if ($oauth.PSObject.Properties["expiresAt"]) { $oauth.expiresAt = $newExp }
-            else { $oauth | Add-Member -NotePropertyName expiresAt -NotePropertyValue $newExp }
-        }
-        Write-Credentials $cred
-        Write-Log "토큰 갱신 성공 (원본 파일에 되씀)"
+    try {
+        $s = Convert-TokenResponse ($e.TokenJson | ConvertFrom-Json) $null
+        if (-not $s) { throw "토큰 응답을 해석할 수 없음" }
+        Write-OwnAuth $s
+        $script:CachedStore = $s
+        Write-Log "로그인 성공"
+    } catch {
+        Write-Log "로그인 응답 처리 실패: $($_.Exception.Message)"
+        $script:LastError = "로그인 실패 — 다시 시도해 주세요"
+        Render-State
+        return
     }
-    return $oauth.accessToken
+    Update-Usage
 }
 
 # ---- 사용량 조회 ----
@@ -142,7 +291,7 @@ function Get-Usage {
         $code = 0
         try { $code = [int]$_.Exception.Response.StatusCode } catch {}
         if ($code -eq 429) { throw "일시 요청 제한(429) — 다음 갱신 때 자동 재시도" }
-        if ($code -eq 401) { throw "인증 만료(401) — 다음 갱신 때 다시 시도" }
+        if ($code -eq 401) { $script:CachedStore = $null; throw "인증 만료(401) — 다음 갱신 때 다시 시도" }
         throw "사용량 조회 실패($code): $($_.Exception.Message)"
     }
     $windows = @()
@@ -178,10 +327,17 @@ function Get-Usage {
 $script:UiSource = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -546,6 +702,216 @@ namespace Cubr {
                 g.FillEllipse(b, knob);
         }
     }
+
+    // ---- 앱 전용 로그인: 브라우저 승인 → localhost 콜백 → 토큰 교환 (PKCE) ----
+    // 대기·교환은 백그라운드 스레드에서 하고, Completed는 Start()를 부른 UI 스레드로 넘겨서 발생시킨다
+    // (PowerShell 스크립트 블록은 UI 스레드에서만 안전하게 실행된다).
+    // Error 값: "port:<상세>", "timeout", "state", "exchange:<HTTP 코드>", "cancelled", "error:<상세>"
+    public class LoginResult : EventArgs {
+        public string TokenJson;
+        public string Error;
+    }
+
+    public class OAuthLogin {
+        public event EventHandler<LoginResult> Completed;
+        public string SuccessHtml = "<!doctype html><meta charset=utf-8><p>OK</p>";
+        public string FailHtml = "<!doctype html><meta charset=utf-8><p>Login failed</p>";
+
+        readonly string clientId, authorizeUrl, tokenUrl, scopes;
+        string verifier, state, redirect;
+        TcpListener listener;
+        SynchronizationContext ctx;
+        volatile bool cancelled;
+        int finished;
+
+        public OAuthLogin(string clientId, string authorizeUrl, string tokenUrl, string scopes) {
+            this.clientId = clientId; this.authorizeUrl = authorizeUrl; this.tokenUrl = tokenUrl; this.scopes = scopes;
+        }
+
+        public void Cancel() {
+            cancelled = true;
+        }
+
+        public void Start() {
+            ctx = SynchronizationContext.Current;
+            verifier = RandomUrlSafe(32);
+            state = RandomUrlSafe(32);
+            try {
+                listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+            } catch (Exception ex) {
+                Finish(null, "port:" + ex.Message);
+                return;
+            }
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            redirect = "http://localhost:" + port + "/callback";
+            string challenge;
+            using (SHA256 sha = SHA256.Create()) {
+                challenge = Base64Url(sha.ComputeHash(Encoding.ASCII.GetBytes(verifier)));
+            }
+            string url = authorizeUrl +
+                "?code=true" +
+                "&client_id=" + Uri.EscapeDataString(clientId) +
+                "&response_type=code" +
+                "&redirect_uri=" + Uri.EscapeDataString(redirect) +
+                "&scope=" + Uri.EscapeDataString(scopes) +
+                "&code_challenge=" + Uri.EscapeDataString(challenge) +
+                "&code_challenge_method=S256" +
+                "&state=" + Uri.EscapeDataString(state);
+            Thread t = new Thread(Run);
+            t.IsBackground = true;
+            t.Start();
+            try { Process.Start(url); } catch (Exception ex) { cancelled = true; Finish(null, "error:" + ex.Message); }
+        }
+
+        void Run() {
+            DateTime deadline = DateTime.UtcNow.AddMinutes(5); // 5분 안에 승인이 안 오면 정리
+            try {
+                while (!cancelled && DateTime.UtcNow < deadline) {
+                    if (!listener.Pending()) { Thread.Sleep(100); continue; }
+                    using (TcpClient client = listener.AcceptTcpClient()) {
+                        client.ReceiveTimeout = 5000;
+                        client.SendTimeout = 5000;
+                        NetworkStream ns = client.GetStream();
+                        string target = ReadTarget(ns);
+                        // 브라우저가 미리 여는 빈 연결이나 favicon 요청은 무시
+                        if (target == null || !target.StartsWith("/callback")) {
+                            Respond(ns, "404 Not Found", "Not found");
+                            continue;
+                        }
+                        Dictionary<string, string> q = ParseQuery(target);
+                        string code, st;
+                        q.TryGetValue("code", out code);
+                        q.TryGetValue("state", out st);
+                        if (string.IsNullOrEmpty(code) || st != state) {
+                            Respond(ns, "400 Bad Request", FailHtml);
+                            Finish(null, "state");
+                            return;
+                        }
+                        Respond(ns, "200 OK", SuccessHtml);
+                        int status;
+                        string json = Exchange(code, out status);
+                        if (json == null) Finish(null, "exchange:" + status);
+                        else Finish(json, null);
+                        return;
+                    }
+                }
+                Finish(null, cancelled ? "cancelled" : "timeout");
+            } catch (Exception ex) {
+                Finish(null, "error:" + ex.Message);
+            } finally {
+                try { listener.Stop(); } catch { }
+            }
+        }
+
+        // 요청 첫 줄 "GET /callback?... HTTP/1.1" 에서 경로만
+        static string ReadTarget(NetworkStream ns) {
+            byte[] buf = new byte[65536];
+            int total = 0;
+            try {
+                while (total < buf.Length) {
+                    int n = ns.Read(buf, total, buf.Length - total);
+                    if (n <= 0) break;
+                    total += n;
+                    if (Encoding.ASCII.GetString(buf, 0, total).Contains("\r\n\r\n")) break;
+                }
+            } catch (IOException) { }
+            if (total == 0) return null;
+            string head = Encoding.ASCII.GetString(buf, 0, total);
+            int eol = head.IndexOf("\r\n");
+            string first = eol >= 0 ? head.Substring(0, eol) : head;
+            string[] parts = first.Split(' ');
+            return parts.Length >= 2 ? parts[1] : null;
+        }
+
+        static Dictionary<string, string> ParseQuery(string target) {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            int qi = target.IndexOf('?');
+            if (qi < 0) return d;
+            foreach (string pair in target.Substring(qi + 1).Split('&')) {
+                if (pair.Length == 0) continue;
+                int eq = pair.IndexOf('=');
+                string k = eq >= 0 ? pair.Substring(0, eq) : pair;
+                string v = eq >= 0 ? pair.Substring(eq + 1) : "";
+                d[Uri.UnescapeDataString(k.Replace('+', ' '))] = Uri.UnescapeDataString(v.Replace('+', ' '));
+            }
+            return d;
+        }
+
+        static void Respond(NetworkStream ns, string status, string body) {
+            try {
+                byte[] b = Encoding.UTF8.GetBytes(body);
+                string head = "HTTP/1.1 " + status + "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " +
+                              b.Length + "\r\nConnection: close\r\n\r\n";
+                byte[] h = Encoding.ASCII.GetBytes(head);
+                ns.Write(h, 0, h.Length);
+                ns.Write(b, 0, b.Length);
+                ns.Flush();
+            } catch (IOException) { }
+        }
+
+        string Exchange(string code, out int status) {
+            status = 0;
+            string body = "{" +
+                "\"grant_type\":\"authorization_code\"," +
+                "\"code\":" + J(code) + "," +
+                "\"redirect_uri\":" + J(redirect) + "," +
+                "\"client_id\":" + J(clientId) + "," +
+                "\"code_verifier\":" + J(verifier) + "," +
+                "\"state\":" + J(state) + "}";
+            try {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(tokenUrl);
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.Timeout = 30000;
+                byte[] b = Encoding.UTF8.GetBytes(body);
+                req.ContentLength = b.Length;
+                using (Stream s = req.GetRequestStream()) { s.Write(b, 0, b.Length); }
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
+                    status = (int)resp.StatusCode;
+                    return r.ReadToEnd();
+                }
+            } catch (WebException ex) {
+                HttpWebResponse er = ex.Response as HttpWebResponse;
+                if (er != null) { status = (int)er.StatusCode; er.Close(); }
+                return null;
+            }
+        }
+
+        static string J(string s) {
+            StringBuilder sb = new StringBuilder("\"");
+            foreach (char c in s ?? "") {
+                if (c == '"' || c == '\\') { sb.Append('\\'); sb.Append(c); }
+                else if (c < 0x20) sb.AppendFormat("\\u{0:x4}", (int)c);
+                else sb.Append(c);
+            }
+            return sb.Append('"').ToString();
+        }
+
+        static string Base64Url(byte[] b) {
+            return Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        static string RandomUrlSafe(int bytes) {
+            byte[] b = new byte[bytes];
+            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider()) { rng.GetBytes(b); }
+            return Base64Url(b);
+        }
+
+        void Finish(string json, string error) {
+            if (Interlocked.Exchange(ref finished, 1) != 0) return;
+            LoginResult r = new LoginResult();
+            r.TokenJson = json;
+            r.Error = error;
+            SendOrPostCallback raise = delegate(object o) {
+                EventHandler<LoginResult> h = Completed;
+                if (h != null) h(this, r);
+            };
+            if (ctx != null) ctx.Post(raise, null);
+            else raise(null);
+        }
+    }
 }
 '@
 
@@ -752,11 +1118,19 @@ function Build-Menu {
     }
     [void]$menu.Items.Add("-")
 
-    # 동작 — 아이콘은 오른쪽 (Segoe MDL2: 문서 E8A5, 새로 고침 E72C, 전원 E7E8)
+    # 동작 — 아이콘은 오른쪽 (Segoe MDL2: 사람 E77B, 시계 E823, 문서 E8A5, 새로 고침 E72C, 전원 E7E8)
+    $loggedIn = ($script:CachedStore -and $script:CachedStore.Source -eq "own")
+    if ($script:LoginInProgress) {
+        $lg = New-Row "로그인 진행 중… (브라우저에서 승인)" ("icon:" + [char]0xE823)
+        $lg.Enabled = $false
+    } else {
+        $lg = New-Row $(if ($loggedIn) { "Claude 다시 로그인" } else { "Claude 로그인 (브라우저)" }) ("icon:" + [char]0xE77B)
+        $lg.add_Click({ Start-Login })   # 메뉴는 다음에 열 때 Opening에서 '진행 중'으로 다시 만들어진다
+    }
     $log = New-Row "오류 기록 열기" ("icon:" + [char]0xE8A5)
     $log.add_Click({ if (Test-Path $script:LogPath) { Start-Process notepad.exe $script:LogPath } else { [System.Windows.Forms.MessageBox]::Show("아직 기록된 오류가 없습니다.", "ClaudeUsageBar") | Out-Null } })
     $refresh = New-Row "지금 갱신" ("icon:" + [char]0xE72C)
-    $refresh.add_Click({ Update-Usage })
+    $refresh.add_Click({ $script:CachedStore = $null; Update-Usage })   # 수동 갱신은 토큰도 원본에서 다시 읽는다
     $exit = New-Row "종료" ("icon:" + [char]0xE7E8)
     $exit.add_Click({
         $script:timer.Stop()
