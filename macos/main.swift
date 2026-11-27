@@ -447,14 +447,6 @@ func resetString(_ date: Date?) -> String {
     return " · 리셋 \(fmt.string(from: date))"
 }
 
-func gauge(_ pct: Double) -> String {
-    switch pct {
-    case ..<50: return "🟢"
-    case ..<80: return "🟡"
-    default: return "🔴"
-    }
-}
-
 // MARK: - CLI 검증 모드 (--once, --login)
 
 if CommandLine.arguments.contains("--login") {
@@ -488,6 +480,320 @@ if CommandLine.arguments.contains("--once") {
 
 // MARK: - 메뉴바 앱
 
+// Claude 앱 아이콘에서 추출한 주황색 (#E28560)
+let claudeOrange = NSColor(srgbRed: 0xE2 / 255.0, green: 0x85 / 255.0, blue: 0x60 / 255.0, alpha: 1)
+
+// 메뉴바 모양(라이트/다크)에 따라 그릴 때마다 색이 정해지는 동적 색
+func dynamicColor(dark: NSColor, light: NSColor) -> NSColor {
+    NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+    }
+}
+
+// 메뉴바 게이지 한 줄: 라벨(색·크기 비율) + 사용률
+struct GaugeRow {
+    let label: String
+    let pct: Double
+    let labelColor: NSColor
+    let labelScale: CGFloat
+}
+
+// MARK: - 드롭다운 메뉴 뷰
+
+// 사용률 구간 색 (메뉴바 바와 같은 기준)
+func usageColor(_ pct: Double) -> NSColor {
+    pct < 50 ? .systemGreen : (pct < 80 ? .systemYellow : .systemRed)
+}
+
+// 숫자 글자색 — 라이트 모드에서는 노랑이 흐려서 주황으로 대신한다
+func usageTextColor(_ pct: Double) -> NSColor {
+    pct < 50 ? .systemGreen : (pct < 80 ? dynamicColor(dark: .systemYellow, light: .systemOrange) : .systemRed)
+}
+
+// 둥근 진행 바 — draw() 안에서 색을 정해 라이트/다크 전환에 자동 대응
+final class MenuBarGaugeView: NSView {
+    let pct: Double
+    init(pct: Double) {
+        self.pct = pct
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 6).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds
+        let track = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
+        NSColor.labelColor.withAlphaComponent(0.1).setFill()
+        track.fill()
+        let frac = CGFloat(min(max(pct / 100, 0), 1))
+        guard frac > 0 else { return }
+        let w = max(r.height, r.width * frac) // 아주 작은 값도 점으로는 보이게
+        let fill = NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: w, height: r.height),
+                                xRadius: r.height / 2, yRadius: r.height / 2)
+        usageColor(pct).setFill()
+        fill.fill()
+    }
+}
+
+func menuLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
+               color: NSColor = .labelColor, monoDigits: Bool = false) -> NSTextField {
+    let f = NSTextField(labelWithString: text)
+    f.font = monoDigits ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
+                        : .systemFont(ofSize: size, weight: weight)
+    f.textColor = color
+    f.lineBreakMode = .byTruncatingTail
+    return f
+}
+
+func symbolView(_ name: String, size: CGFloat, color: NSColor) -> NSImageView {
+    let v = NSImageView()
+    v.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+        .withSymbolConfiguration(.init(pointSize: size, weight: .medium))
+    v.contentTintColor = color
+    v.setContentHuggingPriority(.required, for: .horizontal)
+    return v
+}
+
+// 메뉴 상단 카드: 헤더(마크·제목·갱신 시각) + 오류 + 창별 사용량
+func makeUsagePanel(windows: [UsageWindow], error: String?, lastUpdate: Date?,
+                    stale: Bool, mark: NSImage?) -> NSView {
+    let width = menuWidth
+    let stack = NSStackView()
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 12
+    stack.edgeInsets = NSEdgeInsets(top: 8, left: menuPad, bottom: 10, right: menuPad)
+    stack.translatesAutoresizingMaskIntoConstraints = false
+
+    // 헤더
+    let iconView = NSImageView()
+    if let mark = mark {
+        iconView.image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            mark.draw(in: rect)
+            claudeOrange.setFill()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+    } else {
+        iconView.image = NSImage(systemSymbolName: "sparkle", accessibilityDescription: nil)
+        iconView.contentTintColor = claudeOrange
+    }
+    iconView.setContentHuggingPriority(.required, for: .horizontal)
+    let title = menuLabel("Claude 사용량", size: 13, weight: .semibold)
+    var updateText = "갱신 대기 중"
+    if let t = lastUpdate {
+        let fmt = DateFormatter()
+        fmt.dateFormat = Calendar.current.isDateInToday(t) ? "HH:mm:ss" : "M/d HH:mm"
+        updateText = "마지막 갱신 \(fmt.string(from: t))" + (stale ? " (오래된 값)" : "")
+    }
+    let update = menuLabel(updateText, size: 10.5, color: stale ? .systemOrange : .secondaryLabelColor,
+                           monoDigits: true)
+    // 제목 아래 줄에 갱신 시각 — 오래된 값 표시가 붙어도 제목이 잘리지 않게
+    let titles = NSStackView(views: [title, update])
+    titles.orientation = .vertical
+    titles.alignment = .leading
+    titles.spacing = 1
+    let header = NSStackView(views: [iconView, titles])
+    header.spacing = 8
+    header.alignment = .centerY
+    stack.addArrangedSubview(header)
+
+    // 오류
+    if let err = error {
+        let msg = NSTextField(wrappingLabelWithString: err)
+        msg.font = .systemFont(ofSize: 11)
+        msg.textColor = .secondaryLabelColor
+        msg.preferredMaxLayoutWidth = width - menuPad * 2 - 22
+        let icon = symbolView("exclamationmark.triangle.fill", size: 12, color: .systemOrange)
+        let sp = NSView()
+        sp.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [msg, sp, icon]) // 텍스트 왼쪽, 아이콘 오른쪽
+        row.alignment = .top
+        row.spacing = 8
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalToConstant: width - menuPad * 2).isActive = true
+    }
+
+    // 창별 사용량
+    for w in windows {
+        let name = menuLabel(windowLabels[w.key] ?? w.key, size: 12, weight: .medium)
+        let pctLabel = menuLabel("\(Int(w.utilization.rounded()))%", size: 13, weight: .semibold,
+                                 color: usageTextColor(w.utilization), monoDigits: true)
+        let sp = NSView()
+        sp.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let top = NSStackView(views: [name, sp, pctLabel])
+        let bar = MenuBarGaugeView(pct: w.utilization)
+        var rows: [NSView] = [top, bar]
+        let reset = resetString(w.resetsAt).replacingOccurrences(of: " · ", with: "")
+        if !reset.isEmpty {
+            rows.append(menuLabel(reset, size: 10.5, color: .secondaryLabelColor, monoDigits: true))
+        }
+        let block = NSStackView(views: rows)
+        block.orientation = .vertical
+        block.alignment = .leading
+        block.spacing = 5
+        for v in [top, bar] {
+            v.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
+        }
+        stack.addArrangedSubview(block)
+        block.widthAnchor.constraint(equalToConstant: width - menuPad * 2).isActive = true
+    }
+    header.widthAnchor.constraint(equalToConstant: width - menuPad * 2).isActive = true
+
+    let container = NSView()
+    container.addSubview(stack)
+    NSLayoutConstraint.activate([
+        stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        stack.topAnchor.constraint(equalTo: container.topAnchor),
+        stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        stack.widthAnchor.constraint(equalToConstant: width),
+    ])
+    container.frame = NSRect(origin: .zero, size: container.fittingSize)
+    return container
+}
+
+// 메뉴 안 토글 스위치. 기본 NSSwitch는 메뉴(비활성 창)에서 켜짐 색이 빠져 회색으로만 보여서 직접 그린다.
+// 켜짐 = Claude 주황, 꺼짐 = 회색 트랙. 잠김(마지막 하나라 끌 수 없음)일 때는 흐리게.
+final class MenuToggle: NSView {
+    var isOn = true { didSet { needsDisplay = true } }
+    var isLocked = false { didSet { needsDisplay = true } }
+    var onChange: ((Bool) -> Void)?
+    private let size = NSSize(width: 30, height: 17)
+
+    init() {
+        super.init(frame: NSRect(origin: .zero, size: size))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: size.width).isActive = true
+        heightAnchor.constraint(equalToConstant: size.height).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let track = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
+        let onColor = claudeOrange.withAlphaComponent(isLocked ? 0.55 : 1)
+        let offColor = NSColor.labelColor.withAlphaComponent(0.18)
+        (isOn ? onColor : offColor).setFill()
+        track.fill()
+        // 손잡이 — 그림자 있는 흰 원
+        let d = r.height - 3
+        let x = isOn ? r.maxX - d - 1.5 : r.minX + 1.5
+        let knob = NSBezierPath(ovalIn: NSRect(x: x, y: r.minY + 1.5, width: d, height: d))
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.3)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        NSColor.white.withAlphaComponent(isLocked ? 0.85 : 1).setFill()
+        knob.fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        guard !isLocked else { return }
+        isOn.toggle()
+        onChange?(isOn)
+    }
+}
+
+// 드롭다운 공통 치수 — 모든 줄의 텍스트는 왼쪽 menuPad, 아이콘·체크·토글은 오른쪽 menuPad에 맞춘다
+let menuWidth: CGFloat = 280
+let menuPad: CGFloat = 16
+
+// 드롭다운 한 줄: 왼쪽 텍스트 + 오른쪽 액세서리(아이콘/체크/토글).
+// 기본 NSMenuItem은 체크·아이콘 칸 때문에 텍스트 시작 위치가 달라져서, 모든 줄을 이 뷰로 그린다.
+final class MenuRow: NSView {
+    let label: NSTextField
+    let accessory: NSView?
+    let accessoryTint: NSColor?
+    var onClick: (() -> Void)?
+    var closesMenu = true      // 누르면 메뉴를 닫을지 (토글 줄은 열어 둔다)
+    var highlightable = true   // 마우스를 올렸을 때 강조 배경을 그릴지
+    var enabled = true { didSet { needsDisplay = true } }
+    private let baseColor: NSColor
+
+    init(title: String, accessory: NSView? = nil, accessoryTint: NSColor? = nil, height: CGFloat = 24,
+         font: NSFont = .systemFont(ofSize: 13), color: NSColor = .labelColor) {
+        label = NSTextField(labelWithString: title)
+        label.font = font
+        label.textColor = color
+        label.lineBreakMode = .byTruncatingTail
+        baseColor = color
+        self.accessory = accessory
+        self.accessoryTint = accessoryTint
+        super.init(frame: NSRect(x: 0, y: 0, width: menuWidth, height: height))
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        var cs = [
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: menuPad),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ]
+        if let acc = accessory {
+            acc.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(acc)
+            cs += [
+                acc.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -menuPad),
+                acc.centerYAnchor.constraint(equalTo: centerYAnchor),
+                label.trailingAnchor.constraint(lessThanOrEqualTo: acc.leadingAnchor, constant: -8),
+            ]
+        } else {
+            cs.append(label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -menuPad))
+        }
+        NSLayoutConstraint.activate(cs)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // 메뉴가 강조 상태를 바꿀 때마다 다시 그려진다
+    override func draw(_ dirtyRect: NSRect) {
+        let hi = highlightable && enabled && onClick != nil && (enclosingMenuItem?.isHighlighted ?? false)
+        if hi {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 0), xRadius: 4, yRadius: 4).fill()
+        }
+        label.textColor = hi ? .white : (enabled ? baseColor : .tertiaryLabelColor)
+        if let iv = accessory as? NSImageView {
+            iv.contentTintColor = hi ? .white : (enabled ? accessoryTint : .tertiaryLabelColor)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard enabled, let action = onClick else { return }
+        if closesMenu {
+            enclosingMenuItem?.menu?.cancelTracking()
+            DispatchQueue.main.async { action() } // 메뉴가 닫힌 뒤 실행
+        } else {
+            action()
+        }
+    }
+}
+
+func menuItem(_ view: NSView) -> NSMenuItem {
+    let item = NSMenuItem()
+    item.view = view
+    return item
+}
+
+// 섹션 제목 줄 — 작은 회색 굵은 글씨, 텍스트 시작 위치는 다른 줄과 같다
+func sectionHeader(_ title: String) -> NSMenuItem {
+    let row = MenuRow(title: title, height: 22, font: .systemFont(ofSize: 11, weight: .semibold),
+                      color: .secondaryLabelColor)
+    row.highlightable = false
+    return menuItem(row)
+}
+
+// 오른쪽 아이콘 (SF Symbol)
+func accessoryIcon(_ name: String, color: NSColor = .secondaryLabelColor, size: CGFloat = 12) -> NSImageView {
+    let v = symbolView(name, size: size, color: color)
+    return v
+}
+
+func symbol(_ name: String) -> NSImage? {
+    NSImage(systemSymbolName: name, accessibilityDescription: nil)
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
@@ -495,10 +801,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastError: String?
     var lastUpdate: Date?
 
-    // 상태바에 표시할 기준 창 (five_hour | seven_day) — 재시작 후에도 유지
-    var displayKey: String {
-        get { UserDefaults.standard.string(forKey: "displayWindow") ?? "five_hour" }
-        set { UserDefaults.standard.set(newValue, forKey: "displayWindow") }
+    // 메뉴바에 표시할 줄 (five_hour, seven_day) — 최소 한 줄은 켜져 있어야 한다. 재시작 후에도 유지
+    let displayKeys = ["five_hour", "seven_day"]
+    func isShown(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: "show_\(key)") as? Bool ?? true
+    }
+    func setShown(_ key: String, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "show_\(key)")
+    }
+    var displaySwitches: [String: MenuToggle] = [:]
+
+    // 켜진 줄이 하나뿐이면 그 스위치는 끌 수 없게 비활성화
+    func updateSwitchLocks() {
+        let onCount = displayKeys.filter(isShown).count
+        for (key, sw) in displaySwitches {
+            sw.isOn = isShown(key)
+            sw.isLocked = onCount == 1 && isShown(key)
+        }
+    }
+
+    func toggleDisplay(_ key: String, _ on: Bool) {
+        if !on && displayKeys.filter(isShown).count <= 1 { return }
+        setShown(key, on)
+        updateSwitchLocks()
+        updateTitle()
+    }
+
+    // 메뉴 안 토글 한 줄: 제목 + 스위치 (클릭해도 메뉴가 닫히지 않는다)
+    func makeSwitchRow(_ title: String, key: String) -> NSView {
+        let sw = MenuToggle()
+        sw.onChange = { [weak self] on in self?.toggleDisplay(key, on) }
+        displaySwitches[key] = sw
+        let row = MenuRow(title: title, accessory: sw, height: 26)
+        row.highlightable = false
+        row.closesMenu = false
+        // 글자 쪽을 눌러도 토글된다
+        row.onClick = { [weak sw] in
+            guard let sw = sw, !sw.isLocked else { return }
+            sw.isOn.toggle()
+            sw.onChange?(sw.isOn)
+        }
+        return row
     }
 
     // 갱신 주기(초) — 기본 3분. 잦은 요청은 API 429 제한을 유발할 수 있음
@@ -516,8 +859,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 노치 맥북은 메뉴바 공간이 부족하면 아이콘을 통째로 숨기므로 폭을 최소화한다.
     func setBarText(_ s: String) {
+        statusItem.button?.image = nil
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         statusItem.button?.attributedTitle = NSAttributedString(string: s, attributes: [.font: font])
+    }
+
+    // Claude 데스크톱 앱의 메뉴바 마크를 실행 시 읽어 온다 (저장소에 상표 이미지를 넣지 않기 위해).
+    // 데스크톱 앱이 없으면 nil → ✳ 문자로 대신 그린다.
+    lazy var claudeMark: NSImage? = Bundle(path: "/Applications/Claude.app")?.image(forResource: "TrayIconTemplate")
+
+    // 두 줄 게이지: 위 = 5시간 창, 아래 = 주간 한도. 각 줄은 100% 기준 진행 바 + 숫자.
+    // 바 색은 사용률(50/80% 경계)에 따라 초록/노랑/빨강.
+    // drawingHandler 방식이라 라이트/다크 메뉴바 전환 시 자동으로 다시 그려진다.
+    func setBarGauge(_ rows: [GaugeRow], mark: String) {
+        guard !rows.isEmpty else { return }
+        let iconSize: CGFloat = 16, gap: CGFloat = 3
+        let barWidth: CGFloat = 36, barHeight: CGFloat = 5
+        let textGap: CGFloat = 4, rowGap: CGFloat = 2
+        // 숫자 높이(capHeight)가 바 높이의 1.5배가 되도록 글자 크기를 정한다
+        let probe = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        let fontSize = barHeight * 1.5 / (probe.capHeight / 10)
+        let textFont = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold)
+        let rowHeight = max(barHeight, textFont.capHeight)
+        // 바 오른쪽 사용량 숫자는 라벨보다 살짝 작게 (85%)
+        let numberFont = NSFont.monospacedDigitSystemFont(ofSize: fontSize * 0.85, weight: .semibold)
+        // ⚠ 는 첫 줄 숫자 뒤에만 붙인다
+        let texts = rows.enumerated().map { i, r in "\(Int(r.pct.rounded()))%" + (i == 0 ? mark : "") }
+        // 바 왼쪽 라벨(5h, W) — 오른쪽 정렬해서 두 바의 시작점을 맞춘다
+        let labelGap: CGFloat = 3
+        // 라벨 글꼴은 줄마다 크기 비율(labelScale)을 따로 적용한다
+        let labelFonts = rows.map {
+            // 라벨 전체를 10% 줄인 뒤 줄마다 비율 적용
+            NSFont.monospacedDigitSystemFont(ofSize: fontSize * 0.9 * $0.labelScale, weight: .semibold)
+        }
+        let labelWidth = zip(rows, labelFonts).map {
+            ceil(NSAttributedString(string: $0.label, attributes: [.font: $1]).size().width)
+        }.max() ?? 0
+        let barX = iconSize + gap + labelWidth + labelGap
+        let textWidth = texts.map {
+            ceil(NSAttributedString(string: $0, attributes: [.font: numberFont]).size().width)
+        }.max() ?? 0
+        let blockHeight = rowHeight * CGFloat(rows.count) + rowGap * CGFloat(rows.count - 1)
+        let height = max(iconSize, ceil(blockHeight))
+        let total = NSSize(width: barX + barWidth + textGap + textWidth, height: height)
+        let icon = claudeMark
+        let image = NSImage(size: total, flipped: false) { _ in
+            // 1) Claude 마크 — 세로 가운데, Claude 앱 아이콘의 주황색으로 칠한다 (라이트/다크 공통)
+            let iconRect = NSRect(x: 0, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
+            if let icon = icon {
+                icon.draw(in: iconRect)
+                claudeOrange.setFill()
+                iconRect.fill(using: .sourceAtop)
+            } else {
+                let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+                let s = NSAttributedString(string: "✳", attributes: [.font: font, .foregroundColor: claudeOrange])
+                let sz = s.size()
+                s.draw(at: NSPoint(x: iconRect.midX - sz.width / 2, y: iconRect.midY - sz.height / 2))
+            }
+            // 2) 줄마다 바 + 숫자 (위에서부터)
+            let top = (height + blockHeight) / 2
+            for (i, row) in rows.enumerated() {
+                let pct = row.pct
+                let centerY = top - rowHeight / 2 - CGFloat(i) * (rowHeight + rowGap)
+                let frac = CGFloat(min(max(pct / 100, 0), 1))
+                let fillColor: NSColor = pct < 50 ? .systemGreen : (pct < 80 ? .systemYellow : .systemRed)
+                let barRect = NSRect(x: barX, y: centerY - barHeight / 2, width: barWidth, height: barHeight)
+                let r = barRect.insetBy(dx: 0.5, dy: 0.5)
+                let track = NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2)
+                NSColor.labelColor.withAlphaComponent(0.15).setFill()
+                track.fill()
+                if frac > 0 {
+                    NSGraphicsContext.saveGraphicsState()
+                    track.addClip()
+                    fillColor.setFill()
+                    NSRect(x: r.minX, y: r.minY, width: r.width * frac, height: r.height).fill()
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+                NSColor.labelColor.withAlphaComponent(0.45).setStroke()
+                track.lineWidth = 1
+                track.stroke()
+                // 숫자 가운데를 바 가운데에 맞춘다
+                if let ctx = NSGraphicsContext.current?.cgContext {
+                    let attr = NSAttributedString(string: texts[i], attributes: [
+                        .font: numberFont, .foregroundColor: row.labelColor, // 숫자도 라벨과 같은 색
+                    ])
+                    ctx.textPosition = CGPoint(x: barRect.maxX + textGap, y: centerY - numberFont.capHeight / 2)
+                    CTLineDraw(CTLineCreateWithAttributedString(attr), ctx)
+                    // 라벨 — 줄마다 지정한 색·크기, 세로 가운데는 바에 맞춘다
+                    let lf = labelFonts[i]
+                    let lab = NSAttributedString(string: row.label, attributes: [
+                        .font: lf, .foregroundColor: row.labelColor,
+                    ])
+                    let lw = lab.size().width
+                    ctx.textPosition = CGPoint(x: barX - labelGap - lw, y: centerY - lf.capHeight / 2)
+                    CTLineDraw(CTLineCreateWithAttributedString(lab), ctx)
+                }
+            }
+            return true
+        }
+        guard let button = statusItem.button else { return }
+        button.image = image
+        button.imagePosition = .imageOnly
+        button.title = ""
     }
 
     // 마지막 성공 후 이만큼 지나면 '오래된 값'으로 본다 (갱신 주기 3회분 + 여유)
@@ -528,13 +971,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateTitle() {
         guard !lastWindows.isEmpty else { return }
-        let target = lastWindows.first { $0.key == displayKey }
-            ?? lastWindows.first { $0.key == "five_hour" }
-            ?? lastWindows[0]
-        let prefix = displayKey == "seven_day" ? "주" : ""
+        // 위 = 5시간 창, 아래 = 주간 한도 (응답에 없는 창은 건너뛴다)
+        // 5h = 다크 흰색 / 라이트 검정, W = 다크 밝은 하늘색 / 라이트 진한 파랑 (+ 조금 작게)
+        let specs: [(key: String, label: String, color: NSColor, scale: CGFloat)] = [
+            ("five_hour", "5h", dynamicColor(dark: .white, light: .black), 1.0),
+            ("seven_day", "W", dynamicColor(
+                dark: NSColor(srgbRed: 0.45, green: 0.78, blue: 1.0, alpha: 1),
+                light: NSColor(srgbRed: 0.0, green: 0.38, blue: 0.80, alpha: 1)), 0.85),
+        ]
+        let rows = specs.filter { isShown($0.key) }.compactMap { sp in
+            lastWindows.first { $0.key == sp.key }.map {
+                GaugeRow(label: sp.label, pct: $0.utilization, labelColor: sp.color, labelScale: sp.scale)
+            }
+        }
         // 갱신이 끊긴 채 옛 수치를 보여줄 때는 ⚠ 를 붙여 정상값처럼 보이지 않게 한다
         let mark = (lastError != nil || isStale) ? "⚠" : ""
-        setBarText("✳\(prefix)\(Int(target.utilization.rounded()))%\(mark)")
+        setBarGauge(rows.isEmpty
+            ? [GaugeRow(label: "", pct: lastWindows[0].utilization, labelColor: .labelColor, labelScale: 1)]
+            : rows, mark: mark)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -581,66 +1035,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func rebuildMenu() {
         let menu = NSMenu()
-        if let err = lastError {
-            let item = NSMenuItem(title: "⚠️ \(err)", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        for w in lastWindows {
-            let label = windowLabels[w.key] ?? w.key
-            let title = "\(gauge(w.utilization)) \(label): \(Int(w.utilization.rounded()))%\(resetString(w.resetsAt))"
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        if let t = lastUpdate {
-            let fmt = DateFormatter()
-            fmt.dateFormat = Calendar.current.isDateInToday(t) ? "HH:mm:ss" : "M/d HH:mm"
-            let note = isStale ? " (오래된 값)" : ""
-            let item = NSMenuItem(title: "마지막 갱신 \(fmt.string(from: t))\(note)", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
+        // 상단 사용량 카드 (오류·창별 사용량·마지막 갱신을 한 패널에)
+        let panel = NSMenuItem()
+        panel.view = makeUsagePanel(windows: lastWindows, error: lastError, lastUpdate: lastUpdate,
+                                    stale: lastUpdate != nil && isStale, mark: claudeMark)
+        menu.addItem(panel)
         menu.addItem(.separator())
-        let header = NSMenuItem(title: "상태바 표시 기준", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        for (key, label) in [("five_hour", "5시간 창"), ("seven_day", "주간 한도")] {
-            let item = NSMenuItem(title: label, action: #selector(selectDisplay(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = key
-            item.state = (displayKey == key) ? .on : .off
-            menu.addItem(item)
+        menu.addItem(sectionHeader("메뉴바 표시"))
+        displaySwitches = [:]
+        for (key, title) in [("five_hour", "5시간 (5h)"), ("seven_day", "주간 (W)")] {
+            menu.addItem(menuItem(makeSwitchRow(title, key: key)))
         }
+        updateSwitchLocks()
         menu.addItem(.separator())
-        let intervalHeader = NSMenuItem(title: "갱신 주기", action: nil, keyEquivalent: "")
-        intervalHeader.isEnabled = false
-        menu.addItem(intervalHeader)
+        menu.addItem(sectionHeader("갱신 주기"))
         let intervals: [(Double, String)] = [
             (60, "1분"),
-            (120, "2분 (추천)"),
-            (180, "3분 (가장 추천)"),
+            (120, "2분"),
+            (180, "3분"),
         ]
         for (sec, label) in intervals {
-            let item = NSMenuItem(title: label, action: #selector(selectInterval(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = sec
-            item.state = (refreshInterval == sec) ? .on : .off
-            menu.addItem(item)
+            let selected = refreshInterval == sec
+            let row = MenuRow(title: label,
+                              accessory: selected ? accessoryIcon("checkmark", color: claudeOrange) : nil,
+                              accessoryTint: claudeOrange)
+            row.onClick = { [weak self] in
+                self?.refreshInterval = sec
+                self?.startTimer()
+                self?.rebuildMenu()
+            }
+            menu.addItem(menuItem(row))
         }
         menu.addItem(.separator())
         let loggedIn = (cachedStore?.source == .own)
         let loginTitle = loginInProgress ? "로그인 진행 중… (브라우저에서 승인)"
             : (loggedIn ? "Claude 다시 로그인" : "Claude 로그인 (브라우저)")
-        let loginItem = NSMenuItem(title: loginTitle, action: loginInProgress ? nil : #selector(startLogin), keyEquivalent: "")
-        loginItem.target = self
-        menu.addItem(loginItem)
-        let refreshItem = NSMenuItem(title: "지금 갱신", action: #selector(refreshNow), keyEquivalent: "r")
+        let loginRow = MenuRow(title: loginTitle,
+                               accessory: accessoryIcon(loginInProgress ? "hourglass" : "person.crop.circle"),
+                               accessoryTint: .secondaryLabelColor)
+        loginRow.enabled = !loginInProgress
+        loginRow.onClick = { [weak self] in self?.startLogin() }
+        menu.addItem(menuItem(loginRow))
+
+        let refreshRow = MenuRow(title: "지금 갱신", accessory: accessoryIcon("arrow.clockwise"),
+                                 accessoryTint: .secondaryLabelColor)
+        refreshRow.onClick = { [weak self] in self?.refreshNow() }
+        let refreshItem = menuItem(refreshRow)
+        // 단축키(⌘R)는 보이지 않아도 메뉴가 열린 상태에서 동작하도록 유지
+        refreshItem.keyEquivalent = "r"
+        refreshItem.action = #selector(refreshNow)
         refreshItem.target = self
         menu.addItem(refreshItem)
-        let quitItem = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let quitRow = MenuRow(title: "종료", accessory: accessoryIcon("power"), accessoryTint: .secondaryLabelColor)
+        quitRow.onClick = { NSApp.terminate(nil) }
+        let quitItem = menuItem(quitRow)
+        quitItem.keyEquivalent = "q"
+        quitItem.action = #selector(NSApplication.terminate(_:))
         quitItem.target = NSApp
         menu.addItem(quitItem)
+        // 뷰 항목은 action이 없어도 강조(호버)되도록 자동 비활성화를 끈다
+        menu.autoenablesItems = false
         statusItem.menu = menu
     }
 
@@ -667,19 +1122,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    @objc func selectDisplay(_ sender: NSMenuItem) {
-        if let key = sender.representedObject as? String { displayKey = key }
-        updateTitle()
-        rebuildMenu()
-    }
-
-    @objc func selectInterval(_ sender: NSMenuItem) {
-        if let sec = sender.representedObject as? Double {
-            refreshInterval = sec
-            startTimer()
-        }
-        rebuildMenu()
-    }
 }
 
 let app = NSApplication.shared
